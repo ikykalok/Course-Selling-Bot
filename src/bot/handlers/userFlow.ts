@@ -1,0 +1,640 @@
+import { Context } from 'telegraf';
+import fs from 'fs';
+import path from 'path';
+import { googleSheetsService } from '../../services/googleSheets.js';
+import { messages } from '../messages/templates.js';
+import { keyboards } from '../keyboards/inline.js';
+import { config } from '../../config/config.js';
+import { handleSearchPrompt } from './commands.js';
+import { Course } from '../../types/index.js';
+
+export interface UserSession {
+  step: 'IDLE' | 'SEARCHING_COURSE' | 'AWAITING_PAYMENT_SCREENSHOT';
+  selectedCourseId?: string;
+  pendingAmount?: number;
+  updatedAt: number;
+}
+
+// Memory-safe Session Manager with TTL and automatic garbage collection
+class SessionManager {
+  private sessions = new Map<number, UserSession>();
+  private readonly SESSION_TTL = 20 * 60 * 1000; // 20 minutes expiry
+
+  constructor() {
+    // Run cleanup every 10 minutes to prevent memory leak
+    const interval = setInterval(() => this.cleanupStaleSessions(), 10 * 60 * 1000);
+    if (interval.unref) interval.unref();
+  }
+
+  public getSession(userId: number): UserSession {
+    const session = this.sessions.get(userId);
+    const now = Date.now();
+
+    if (!session) {
+      return { step: 'IDLE', updatedAt: now };
+    }
+
+    // Auto-expire stale session
+    if (now - session.updatedAt > this.SESSION_TTL) {
+      this.sessions.delete(userId);
+      return { step: 'IDLE', updatedAt: now };
+    }
+
+    return session;
+  }
+
+  public setStep(userId: number, step: UserSession['step'], extra?: { courseId?: string; amount?: number }) {
+    const current = this.getSession(userId);
+    this.sessions.set(userId, {
+      ...current,
+      step,
+      ...(extra?.courseId !== undefined ? { selectedCourseId: extra.courseId } : {}),
+      ...(extra?.amount !== undefined ? { pendingAmount: extra.amount } : {}),
+      updatedAt: Date.now()
+    });
+  }
+
+  public reset(userId: number) {
+    this.sessions.delete(userId);
+  }
+
+  private cleanupStaleSessions() {
+    const now = Date.now();
+    for (const [userId, session] of this.sessions.entries()) {
+      if (now - session.updatedAt > this.SESSION_TTL) {
+        this.sessions.delete(userId);
+      }
+    }
+  }
+}
+
+export const sessionManager = new SessionManager();
+
+export async function handleUserText(ctx: Context) {
+  if (!ctx.from || !('text' in (ctx.message || {}))) return;
+  const userId = ctx.from.id;
+  const rawText = (ctx.message as { text: string }).text.trim();
+
+  // If user sent a command starting with '/', allow command routing
+  if (rawText.startsWith('/')) {
+    sessionManager.reset(userId);
+    return;
+  }
+
+  const session = sessionManager.getSession(userId);
+
+  // User was prompted to search a course
+  if (session.step === 'SEARCHING_COURSE') {
+    sessionManager.setStep(userId, 'IDLE');
+    try {
+      const startTime = Date.now();
+      const results = await googleSheetsService.searchCourses(rawText);
+      const duration = Date.now() - startTime;
+      console.log(`🔎 [Search] Query "${rawText}" by User ${userId} -> ${results.length} found in ${duration}ms`);
+
+      if (results.length === 0) {
+        await ctx.reply(
+          `❌ <b>No course found for "${rawText}".</b>\n\nTry searching with another keyword or browse all available courses below:`,
+          {
+            parse_mode: 'HTML',
+            ...keyboards.courseList(await googleSheetsService.getCourses(true), 1)
+          }
+        );
+        return;
+      }
+
+      // If single course match, present directly with thumbnail photo!
+      if (results.length === 1) {
+        await sendCourseCard(ctx, results[0]);
+        return;
+      }
+
+      await ctx.reply(
+        `🔎 <b>RESULTS FOR:</b> "${rawText}"\n\nFound <b>${results.length}</b> course(s):`,
+        {
+          parse_mode: 'HTML',
+          ...keyboards.searchResults(results)
+        }
+      );
+    } catch (err: any) {
+      console.error('❌ [Search Error]:', err.message || err);
+      await ctx.reply('⚠️ Search temporarily unavailable. Please try again.');
+    }
+    return;
+  }
+
+  // User is awaiting payment screenshot
+  if (session.step === 'AWAITING_PAYMENT_SCREENSHOT') {
+    await ctx.reply(
+      '⚠️ <b>Screenshot Required:</b>\n' +
+      'Please upload an image file of your payment screenshot directly as a photo in this chat.\n\n' +
+      'If you wish to cancel or browse other courses, click below:',
+      {
+        parse_mode: 'HTML',
+        ...keyboards.mainMenu()
+      }
+    );
+    return;
+  }
+
+  // Default friendly fallback for general text
+  await ctx.reply(
+    `🎓 Welcome to Course Bazar! Please choose an option below to browse courses or check your purchases:`,
+    keyboards.mainMenu()
+  );
+}
+
+let cachedQrFileId: string | null = null;
+const thumbnailFileIdCache = new Map<string, string>();
+
+export function invalidateCachedQrFileId(): void {
+  cachedQrFileId = null;
+  console.log('🔄 [QR Cache] Telegram cached QR file ID cleared.');
+}
+
+function withFastTimeout<T>(promise: Promise<T>, ms = 1500): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Photo timeout')), ms);
+    promise.then(
+      (res) => {
+        clearTimeout(timer);
+        resolve(res);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+export async function sendCourseCard(ctx: Context, course: Course, prefixText = '') {
+  const cardText = prefixText + messages.courseCard(course);
+  const kb = keyboards.courseDetails(course.courseId);
+
+  // Check if Image Thumbnail Path or URL is provided
+  const thumb = course.thumbnailUrl?.trim();
+  if (thumb) {
+    // Check in-memory Telegram file_id cache for instant edge response (< 50ms)
+    const cachedFileId = thumbnailFileIdCache.get(thumb) || thumbnailFileIdCache.get(course.courseId);
+    if (cachedFileId) {
+      try {
+        await withFastTimeout(
+          ctx.replyWithPhoto(cachedFileId, {
+            caption: cardText,
+            parse_mode: 'HTML',
+            ...kb
+          }),
+          1500
+        );
+        return;
+      } catch (err) {
+        // Invalidate stale file_id and continue to fresh upload/URL
+        thumbnailFileIdCache.delete(thumb);
+        thumbnailFileIdCache.delete(course.courseId);
+      }
+    }
+
+    // 1. If it's a web URL (http:// or https://)
+    if (/^https?:\/\//i.test(thumb)) {
+      try {
+        const sentMsg = await withFastTimeout(
+          ctx.replyWithPhoto(thumb, {
+            caption: cardText,
+            parse_mode: 'HTML',
+            ...kb
+          }),
+          1500
+        );
+        if (sentMsg && 'photo' in sentMsg && Array.isArray(sentMsg.photo) && sentMsg.photo.length > 0) {
+          const fid = sentMsg.photo[sentMsg.photo.length - 1]?.file_id;
+          if (fid) {
+            thumbnailFileIdCache.set(thumb, fid);
+            thumbnailFileIdCache.set(course.courseId, fid);
+          }
+        }
+        return;
+      } catch (err: any) {
+        console.warn(`⚡ [Fast fallback for ${course.courseId}]: ${err.message}. Sending instant text card.`);
+      }
+    }
+    // 2. If it's a local file path
+    else if (fs.existsSync(thumb)) {
+      try {
+        const sentMsg = await withFastTimeout(
+          ctx.replyWithPhoto({ source: thumb }, {
+            caption: cardText,
+            parse_mode: 'HTML',
+            ...kb
+          }),
+          1500
+        );
+        if (sentMsg && 'photo' in sentMsg && Array.isArray(sentMsg.photo) && sentMsg.photo.length > 0) {
+          const fid = sentMsg.photo[sentMsg.photo.length - 1]?.file_id;
+          if (fid) {
+            thumbnailFileIdCache.set(thumb, fid);
+            thumbnailFileIdCache.set(course.courseId, fid);
+          }
+        }
+        return;
+      } catch (err: any) {
+        console.warn(`⚡ [Fast fallback for ${course.courseId}]: ${err.message}. Sending instant text card.`);
+      }
+    }
+  }
+
+  // 3. Ultra-fast fallback: clean text card without image (< 10ms)
+  await ctx.reply(cardText, {
+    parse_mode: 'HTML',
+    ...kb
+  });
+}
+
+export async function handleCourseSelect(ctx: Context, courseId: string) {
+  try {
+    const course = await googleSheetsService.getCourseById(courseId);
+    if (!course) {
+      await ctx.reply('❌ Course not found or has been removed.', keyboards.mainMenu());
+      return;
+    }
+
+    if (course.status.toLowerCase() !== 'active') {
+      await ctx.reply('⚠️ This course is currently unavailable.', keyboards.mainMenu());
+      return;
+    }
+
+    await sendCourseCard(ctx, course);
+  } catch (error: any) {
+    console.error('❌ [CourseSelect Error]:', error.message || error);
+    await ctx.reply('⚠️ Could not open course details.');
+  }
+}
+
+export async function handleBuyNow(ctx: Context, courseId: string) {
+  if (!ctx.from) return;
+  const userId = ctx.from.id;
+
+  try {
+    const course = await googleSheetsService.getCourseById(courseId);
+    if (!course || course.status.toLowerCase() !== 'active') {
+      await ctx.reply('⚠️ This course is no longer active.', keyboards.mainMenu());
+      return;
+    }
+
+    const upiId = await googleSheetsService.getSetting('UPI_ID', config.upiId);
+    const payeeName = await googleSheetsService.getSetting('PAYEE_NAME', config.payeeName);
+
+    sessionManager.setStep(userId, 'IDLE', {
+      courseId: course.courseId,
+      amount: course.price
+    });
+
+    const paymentText = messages.paymentCard(course, upiId, payeeName);
+
+    // 1. Try sending cached QR file_id directly for instant response (< 50ms)
+    if (cachedQrFileId) {
+      try {
+        await ctx.replyWithPhoto(cachedQrFileId, {
+          caption: paymentText,
+          parse_mode: 'HTML',
+          ...keyboards.paymentStep(course.courseId)
+        });
+        return;
+      } catch (cachedErr) {
+        cachedQrFileId = null; // Invalidate if expired
+      }
+    }
+
+    // 2. If not cached yet, upload QR asset once and save file_id
+    if (config.qrImagePath && fs.existsSync(config.qrImagePath)) {
+      try {
+        const sentMsg = await ctx.replyWithPhoto({ source: config.qrImagePath }, {
+          caption: paymentText,
+          parse_mode: 'HTML',
+          ...keyboards.paymentStep(course.courseId)
+        });
+        if (sentMsg && 'photo' in sentMsg && Array.isArray(sentMsg.photo) && sentMsg.photo.length > 0) {
+          cachedQrFileId = sentMsg.photo[sentMsg.photo.length - 1]?.file_id || null;
+        }
+        return;
+      } catch (err) {
+        console.warn('⚠️ QR image send fallback to text card:', (err as Error).message);
+      }
+    }
+
+    // Text card fallback
+    await ctx.reply(paymentText, {
+      parse_mode: 'HTML',
+      ...keyboards.paymentStep(course.courseId)
+    });
+  } catch (error: any) {
+    console.error('❌ [BuyNow Error]:', error.message || error);
+    await ctx.reply('⚠️ Error generating payment screen.');
+  }
+}
+
+export async function handleIHavePaid(ctx: Context, courseId: string) {
+  if (!ctx.from) return;
+  const userId = ctx.from.id;
+
+  try {
+    const course = await googleSheetsService.getCourseById(courseId);
+    const courseName = course ? course.courseName : 'your selected course';
+
+    sessionManager.setStep(userId, 'AWAITING_PAYMENT_SCREENSHOT', {
+      courseId,
+      amount: course?.price
+    });
+
+    await ctx.reply(messages.askScreenshot(courseName), { parse_mode: 'HTML' });
+  } catch (err: any) {
+    console.error('❌ [IHavePaid Error]:', err.message || err);
+    await ctx.reply('⚠️ Please upload your payment screenshot.');
+  }
+}
+
+export async function handlePhotoUpload(ctx: Context) {
+  if (!ctx.from || !('photo' in (ctx.message || {}))) return;
+  const userId = ctx.from.id;
+
+  // Support Admin directly updating default payment QR code by sending a photo with /setqr or /updateqr
+  const caption = ((ctx.message as any)?.caption || '').trim().toLowerCase();
+  if (caption === '/setqr' || caption === '/updateqr' || caption.startsWith('/setqr ') || caption.startsWith('/updateqr ')) {
+    const isOwner = String(userId) === String(config.adminTelegramId);
+    const isAuthorizedAdmin = isOwner || (await googleSheetsService.isAdmin(userId));
+    if (isAuthorizedAdmin) {
+      try {
+        const photos = (ctx.message as { photo: Array<{ file_id: string }> }).photo;
+        const bestPhoto = photos[photos.length - 1];
+        const fileUrl = await ctx.telegram.getFileLink(bestPhoto.file_id);
+        const res = await fetch(fileUrl.href);
+        const buffer = Buffer.from(await res.arrayBuffer());
+        const dir = path.dirname(config.qrImagePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(config.qrImagePath, buffer);
+        invalidateCachedQrFileId();
+        await ctx.reply('✅ <b>Default Payment QR Code Updated!</b>\n\nYour new QR code has been saved and is now live across the bot and website.', { parse_mode: 'HTML' });
+        return;
+      } catch (err: any) {
+        await ctx.reply(`❌ Failed to update QR code: ${err.message}`);
+        return;
+      }
+    }
+  }
+
+  const session = sessionManager.getSession(userId);
+
+  if (!session || !session.selectedCourseId) {
+    await ctx.reply(
+      '⚠️ No active course payment session found. Please select a course first and click <b>🛒 BUY NOW</b>.',
+      { parse_mode: 'HTML', ...keyboards.mainMenu() }
+    );
+    return;
+  }
+
+  const course = await googleSheetsService.getCourseById(session.selectedCourseId);
+  if (!course) {
+    await ctx.reply('❌ Course not found.', keyboards.mainMenu());
+    sessionManager.reset(userId);
+    return;
+  }
+
+  // Pick highest resolution photo
+  const photos = (ctx.message as { photo: Array<{ file_id: string }> }).photo;
+  const bestPhoto = photos[photos.length - 1];
+  const fileId = bestPhoto.file_id;
+
+  const username = ctx.from.username || '';
+  const customerName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'Customer';
+  const paymentId = `PAY-${Date.now().toString(36).toUpperCase()}-${Math.floor(100 + Math.random() * 900)}`;
+
+  try {
+    // 1. Record purchase immediately (Instant in-memory write-through)
+    await googleSheetsService.recordPurchaseSubmission({
+      paymentId,
+      telegramUserId: String(userId),
+      telegramUsername: username,
+      customerName,
+      courseId: course.courseId,
+      courseName: course.courseName,
+      amount: course.price
+    });
+
+    // 2. Reset user session immediately
+    sessionManager.reset(userId);
+
+    // 3. Confirm to customer immediately
+    await ctx.reply(messages.paymentSubmitted(), {
+      parse_mode: 'HTML',
+      ...keyboards.mainMenu()
+    });
+
+    // 4. Send multi-admin notification in non-blocking background task
+    notifyAllAdminsNewPayment(ctx, {
+      paymentId,
+      userId: String(userId),
+      username,
+      customerName,
+      courseId: course.courseId,
+      courseName: course.courseName,
+      amount: course.price,
+      fileId
+    }).catch(adminErr => {
+      console.warn('⚠️ Admin notification warning:', adminErr.message || adminErr);
+    });
+  } catch (error: any) {
+    console.error('❌ [PhotoUpload Error]:', error.message || error);
+    await ctx.reply('⚠️ An error occurred while saving your submission. Please try again.');
+  }
+}
+
+async function notifyAllAdminsNewPayment(
+  ctx: Context,
+  data: {
+    paymentId: string;
+    userId: string;
+    username: string;
+    customerName: string;
+    courseId: string;
+    courseName: string;
+    amount: number;
+    fileId: string;
+  }
+) {
+  const activeAdmins = await googleSheetsService.getActiveApprovalAdmins();
+  if (activeAdmins.length === 0) {
+    console.log('ℹ️ [Admin Alert] No active admins found. Skipping Telegram broadcast.');
+    return;
+  }
+
+  const adminText = messages.adminPaymentNotification({
+    paymentId: data.paymentId,
+    telegramUserId: data.userId,
+    telegramUsername: data.username,
+    customerName: data.customerName,
+    courseId: data.courseId,
+    courseName: data.courseName,
+    amount: data.amount
+  });
+
+  const notificationRecords: Array<{ adminId: string; chatId: string; messageId: number }> = [];
+
+  // Broadcast to all active admins concurrently in parallel
+  await Promise.allSettled(
+    activeAdmins.map(async (admin) => {
+      try {
+        const sentMsg = await ctx.telegram.sendPhoto(admin.telegramId, data.fileId, {
+          caption: adminText,
+          parse_mode: 'HTML',
+          ...keyboards.adminApproval(data.userId, data.courseId, data.paymentId)
+        });
+        notificationRecords.push({
+          adminId: admin.telegramId,
+          chatId: admin.telegramId,
+          messageId: sentMsg.message_id
+        });
+        console.log(`✅ [Admin Alert] Payment notification sent to admin ${admin.name} (${admin.telegramId})`);
+      } catch (err: any) {
+        console.warn(`⚠️ [Admin Alert] Photo send to admin ${admin.name} (${admin.telegramId}) failed (${err.message}). Trying text message fallback...`);
+        try {
+          const sentMsg = await ctx.telegram.sendMessage(admin.telegramId, adminText, {
+            parse_mode: 'HTML',
+            ...keyboards.adminApproval(data.userId, data.courseId, data.paymentId)
+          });
+          notificationRecords.push({
+            adminId: admin.telegramId,
+            chatId: admin.telegramId,
+            messageId: sentMsg.message_id
+          });
+        } catch (textErr: any) {
+          console.warn(`⚠️ [Admin Alert] Text send to admin ${admin.name} (${admin.telegramId}) also failed: ${textErr.message}. Make sure Admin ${admin.telegramId} has clicked /start on the bot.`);
+        }
+      }
+    })
+  );
+
+  // Store message IDs for synchronization and removal when resolved
+  if (notificationRecords.length > 0) {
+    googleSheetsService.setPurchaseNotificationIds(data.userId, data.courseId, notificationRecords, data.paymentId);
+  }
+}
+
+export async function handleGetCourse(ctx: Context, courseId: string) {
+  if (!ctx.from) return;
+  const userId = String(ctx.from.id);
+
+  try {
+    // SECURITY CHECK: Verify Telegram User ID matches purchase AND Status = PAID
+    const purchase = await googleSheetsService.getPurchaseByUserAndCourse(userId, courseId);
+
+    if (!purchase) {
+      await ctx.reply('❌ No purchase record found for this course.', keyboards.mainMenu());
+      return;
+    }
+
+    if (purchase.status !== 'PAID') {
+      let statusNote = 'Payment verification pending.';
+      if (purchase.status === 'REJECTED') statusNote = 'Payment was rejected.';
+      if (purchase.status === 'EXPIRED') statusNote = 'Payment session expired.';
+
+      await ctx.reply(
+        `⛔ <b>Access Restricted</b>\n\nStatus: <b>${statusNote}</b>\nCourse materials and ZIP passwords are only delivered once payment is verified and approved by admin.`,
+        { parse_mode: 'HTML', ...keyboards.mainMenu() }
+      );
+      return;
+    }
+
+    const course = await googleSheetsService.getCourseById(courseId);
+    if (!course) {
+      await ctx.reply('❌ Course data could not be found.', keyboards.mainMenu());
+      return;
+    }
+
+    // Deliver course with Google Drive link and ZIP password!
+    await ctx.reply(messages.paymentApprovedCustomerDelivery(course), {
+      parse_mode: 'HTML',
+      ...keyboards.courseDelivery(course.driveLink)
+    });
+  } catch (error: any) {
+    console.error('❌ [GetCourse Error]:', error.message || error);
+    await ctx.reply('⚠️ Error fetching course details.');
+  }
+}
+
+// Track users currently receiving all course cards to prevent duplicate card delivery from rapid button presses
+const sendingAllUsersInProgress = new Set<number>();
+
+export async function handleSendAllCourseCards(ctx: Context) {
+  const userId = ctx.from?.id;
+  if (userId) {
+    sessionManager.reset(userId);
+    if (sendingAllUsersInProgress.has(userId)) {
+      await ctx.reply('⏳ Course cards are already being sent. Please check your messages above.');
+      return;
+    }
+  }
+
+  try {
+    if (userId) sendingAllUsersInProgress.add(userId);
+
+    // Fetch fresh active courses from Google Sheets / persistent storage
+    const allCourses = await googleSheetsService.getCourses(true);
+
+    // Deduplicate by courseId and ensure status is Active
+    const seenIds = new Set<string>();
+    const uniqueCourses: Course[] = [];
+    for (const c of allCourses) {
+      const id = (c.courseId || '').trim().toLowerCase();
+      if (id && !seenIds.has(id) && c.status.toLowerCase() === 'active') {
+        seenIds.add(id);
+        uniqueCourses.push(c);
+      }
+    }
+
+    if (uniqueCourses.length === 0) {
+      await ctx.reply('📚 No courses are available right now. Please check back later.', keyboards.mainMenu());
+      return;
+    }
+
+    // Short loading / progress announcement
+    await ctx.reply(
+      `📚 <b>Sending all available courses (${uniqueCourses.length} courses)...</b>\n\n<i>Please wait a moment while the courses are delivered.</i>`,
+      { parse_mode: 'HTML' }
+    );
+
+    let sentCount = 0;
+    for (let i = 0; i < uniqueCourses.length; i++) {
+      const course = uniqueCourses[i];
+      try {
+        await sendCourseCard(ctx, course);
+        sentCount++;
+      } catch (err: any) {
+        console.error(`❌ [sendAllCourse] Failed to send card for ${course.courseId}:`, err.message || err);
+      }
+
+      // Safe pause between individual cards to respect Telegram rate limits and avoid flood waits
+      if (i < uniqueCourses.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    // Completion confirmation
+    await ctx.reply(
+      `✅ <b>All ${sentCount} courses sent!</b>\n\nClick <b>🛒 BUY NOW</b> on any course above to purchase.`,
+      {
+        parse_mode: 'HTML',
+        ...keyboards.allCardsCompletion()
+      }
+    );
+  } catch (error: any) {
+    console.error('❌ [handleSendAllCourseCards Error]:', error.message || error);
+    try {
+      await ctx.reply('⚠️ Unable to send course cards at the moment. Please try again.');
+    } catch (e) {}
+  } finally {
+    if (userId) {
+      sendingAllUsersInProgress.delete(userId);
+    }
+  }
+}
+
